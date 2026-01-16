@@ -1,98 +1,122 @@
-import os, json, datetime, subprocess
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import os
+import json
+import time
+import logging
+import threading
+from datetime import datetime, timedelta
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
+import subprocess
 
-# --- VARIABLES (Set these in Render Environment Variables) ---
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-GROUP_ID = int(os.getenv("GROUP_ID", "0"))
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
-REPO_URL = os.getenv("REPO_URL")         # Format: github.com/user/repo.git
+# --- CONFIGURATION ---
+TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+GROUP_ID = os.environ.get("GROUP_ID")  # Format: -100...
+REPO_URL = os.environ.get("REPO_URL")  # github.com/user/repo.git
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+
+# --- FLASK SERVER (For Render Port Check) ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Bot is alive and healthy!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host='0.0.0.0', port=port)
+
+# --- DATABASE LOGIC ---
 DB_FILE = "subscribers.json"
 
-def load_db():
-    if not os.path.exists(DB_FILE):
-        return {"users": {}, "trials": [], "all_users": {}, "codes": {}}
-    with open(DB_FILE, "r") as f:
-        try:
+def load_data():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r") as f:
             return json.load(f)
-        except:
-            return {"users": {}, "trials": [], "all_users": {}, "codes": {}}
+    return {"users": {}}
 
-def save_and_push(data):
-    """Saves data locally and pushes to GitHub to survive Render restarts"""
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-    
+def save_and_push():
+    """Saves data locally and pushes to GitHub to bypass Render's wipe."""
     try:
-        # Configure Git identity for the bot
-        subprocess.run(["git", "config", "user.name", "2Aad-Membership-Bot"])
-        subprocess.run(["git", "config", "user.email", "bot@2aad.com"])
+        # 1. Git Config (Needed for every restart)
+        subprocess.run(["git", "config", "user.name", "RenderBot"], check=True)
+        subprocess.run(["git", "config", "user.email", "bot@render.com"], check=True)
         
-        # Add, commit, and push the updated JSON
-        subprocess.run(["git", "add", DB_FILE])
-        subprocess.run(["git", "commit", "-m", "Update subscribers list"])
+        # 2. Add and Commit
+        subprocess.run(["git", "add", DB_FILE], check=True)
+        subprocess.run(["git", "commit", "-m", "Update subscribers list [skip ci]"], check=True)
         
-        # Authenticate push using the GitHub Token
-        remote_push_url = f"https://{GITHUB_TOKEN}@{REPO_URL}"
-        subprocess.run(["git", "push", remote_push_url, "main"])
-        print("✅ Database synced to GitHub successfully.")
+        # 3. Push using Token
+        remote_url = f"https://{GITHUB_TOKEN}@{REPO_URL}"
+        subprocess.run(["git", "push", remote_url, "main"], check=True)
+        print("✅ Database synced to GitHub.")
     except Exception as e:
-        print(f"❌ Git Push Error: {e}")
+        print(f"❌ Git Push Failed: {e}")
 
-# --- AUTO-REMOVER LOGIC ---
-async def check_expirations(context: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    now = datetime.datetime.now()
-    expired_users = []
-    has_changes = False
+# --- BOT COMMANDS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 Membership Manager is Active.")
 
-    for uid, expiry_str in list(db["users"].items()):
-        try:
-            expiry_dt = datetime.datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
-            if now > expiry_dt:
-                # Ban and Unban to remove from group
-                await context.bot.ban_chat_member(GROUP_ID, int(uid))
-                await context.bot.unban_chat_member(GROUP_ID, int(uid))
-                expired_users.append(uid)
-                has_changes = True
-                await context.bot.send_message(uid, "⚠️ Your 2Aad Premium subscription has expired. Access revoked.")
-        except Exception as e:
-            print(f"Error checking user {uid}: {e}")
-
-    # Clean up expired users from the list
-    for uid in expired_users:
-        del db["users"][uid]
-    
-    if has_changes:
-        save_and_push(db)
-        await context.bot.send_message(ADMIN_ID, f"🧹 Auto-Cleanup: Removed {len(expired_users)} members.")
-
-# --- ADMIN COMMAND TO MANUALLY ADD USERS ---
 async def add_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
+
     try:
-        # Command: /add 12345678 30 (ID and Days)
         user_id = context.args[0]
         days = int(context.args[1])
-        db = load_db()
-        expiry = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        db["users"][user_id] = expiry
-        save_and_push(db)
-        await update.message.reply_text(f"✅ Added {user_id} for {days} days.")
-    except:
-        await update.message.reply_text("Usage: /add USER_ID DAYS")
+        expiry_date = (datetime.now() + timedelta(days=days)).isoformat()
 
+        data = load_data()
+        data["users"][user_id] = expiry_date
+        
+        with open(DB_FILE, "w") as f:
+            json.dump(data, f)
+        
+        save_and_push()
+        await update.message.reply_text(f"✅ User {user_id} added for {days} days.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /add <ID> <DAYS>")
+
+async def check_expirations(context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    now = datetime.now()
+    to_remove = []
+
+    for user_id, expiry_str in data["users"].items():
+        expiry_date = datetime.fromisoformat(expiry_str)
+        if now > expiry_date:
+            try:
+                await context.bot.ban_chat_member(GROUP_ID, user_id)
+                await context.bot.unban_chat_member(GROUP_ID, user_id) # Leave unbanned so they can rejoin later
+                to_remove.append(user_id)
+                print(f"🚫 Removed expired user: {user_id}")
+            except Exception as e:
+                print(f"⚠️ Error removing {user_id}: {e}")
+
+    if to_remove:
+        for uid in to_remove:
+            del data["users"][uid]
+        with open(DB_FILE, "w") as f:
+            json.dump(data, f)
+        save_and_push()
+
+# --- MAIN RUNNER ---
 def main():
-    app = Application.builder().token(TOKEN).build()
+    # Start Flask in background
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Start Telegram Bot
+    app = ApplicationBuilder().token(TOKEN).build()
     
-    # Check every 60 minutes for expired members
-    job_queue = app.job_queue
-    job_queue.run_repeating(check_expirations, interval=3600, first=10)
-    
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_member))
     
-    print("🚀 Membership Manager Running on Render...")
+    # Run cleanup every hour
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_expirations, interval=3600, first=10)
+
+    print("🚀 Bot starting...")
     app.run_polling()
 
 if __name__ == '__main__':
