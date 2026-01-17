@@ -30,15 +30,26 @@ def load_db():
         except: return {"users": {}, "trials": [], "all_users": {}, "codes": {}}
 
 def save_db_and_sync(data):
-    with open(DB_FILE, "w") as f: json.dump(data, f, indent=4)
+    with open(DB_FILE, "w") as f: 
+        json.dump(data, f, indent=4)
+    
     if REPO_URL and GITHUB_TOKEN:
         try:
+            # 1. Identity Config
             subprocess.run(["git", "config", "user.name", "RenderBot"], check=True)
             subprocess.run(["git", "config", "user.email", "bot@render.com"], check=True)
+            
+            # 2. Add and Commit
             subprocess.run(["git", "add", DB_FILE], check=True)
             subprocess.run(["git", "commit", "-m", "Sync DB"], check=True)
-            subprocess.run(["git", "push", f"https://{GITHUB_TOKEN}@{REPO_URL}", "main"], check=True)
-        except: pass
+            
+            # 3. FORCE PUSH to the main branch
+            remote_url = f"https://{GITHUB_TOKEN}@{REPO_URL}"
+            subprocess.run(["git", "push", remote_url, "HEAD:main", "--force"], check=True)
+            
+            print("✅ Successfully forced push to GitHub main branch.")
+        except Exception as e:
+            print(f"❌ Git Sync Failed: {e}")
 
 # ======================================================
 # 🕒 AUTO-KICK SYSTEM
@@ -125,23 +136,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton("✅ Send", callback_data='bc_confirm'), InlineKeyboardButton("❌ Cancel", callback_data='bc_cancel')]]
         return await update.message.reply_text(f"PREVIEW:\n{text}\n\nProceed?", reply_markup=InlineKeyboardMarkup(kb))
 
-    # REDEEM CODE
+    # REDEEM CODE - START
     if text == '🎟 Redeem Code':
         context.user_data['state'] = 'WAIT_CODE'
         return await update.message.reply_text("Enter your 12-digit code:")
 
+    # REDEEM CODE - INPUT RECEIVED
     if state == 'WAIT_CODE':
-        db = load_db(); code = text.upper().strip()
-        if code in db["codes"]:
-            days = db["codes"].pop(code)
-            db["users"][user_id] = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-            save_db_and_sync(db)
-            link = await context.bot.create_chat_invite_link(GROUP_ID, member_limit=1)
-            await update.message.reply_text(f"✅ Success! {days} days added.\nLink: {link.invite_link}")
-            context.user_data['state'] = None
-        else: 
-            await update.message.reply_text("❌ Invalid code.")
-        return
+        code = text.upper().strip()
+        context.user_data['pending_code'] = code
+        context.user_data['state'] = None  # Clear state immediately
+        
+        kb = [[InlineKeyboardButton("✅ Verify Code", callback_data='code_verify'), 
+               InlineKeyboardButton("❌ Cancel", callback_data='code_cancel')]]
+        return await update.message.reply_text(
+            f"🎟 Code: `{code}`\n\nVerify this code?", 
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
     # USER MENUS - Process these BEFORE payment proof forwarding
     if text == '📊 My Status':
@@ -188,7 +199,33 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = str(update.effective_user.id)
 
-    if data.startswith('adm_'):
+    # CODE VERIFICATION
+    if data == 'code_verify':
+        code = context.user_data.get('pending_code')
+        if not code:
+            return await query.message.edit_text("❌ Session expired. Please try again.")
+        
+        db = load_db()
+        
+        # Check if code exists
+        if code not in db["codes"]:
+            context.user_data.pop('pending_code', None)
+            return await query.message.edit_text("❌ Invalid code.")
+        
+        # Code exists - redeem it
+        days = db["codes"].pop(code)
+        db["users"][user_id] = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        save_db_and_sync(db)
+        link = await context.bot.create_chat_invite_link(GROUP_ID, member_limit=1)
+        context.user_data.pop('pending_code', None)
+        await query.message.edit_text(f"✅ Success! {days} days added.\n\nJoin: {link.invite_link}")
+    
+    elif data == 'code_cancel':
+        context.user_data.pop('pending_code', None)
+        await query.message.edit_text("❌ Code redemption cancelled.")
+
+    # ADMIN APPROVAL
+    elif data.startswith('adm_'):
         _, days, uid = data.split('_')
         if days == 'rej':
             await context.bot.send_message(uid, "❌ Rejected.")
@@ -200,6 +237,7 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(uid, f"✅ Approved!\nLink: {link.invite_link}")
         await query.message.edit_text(f"Approved {uid} for {days}D")
 
+    # PAYMENT FLOW
     elif data.startswith('p_'):
         context.user_data['coin'] = data
         kb = [[InlineKeyboardButton("1 Day ($2)", callback_data='d_1')], 
@@ -221,7 +259,6 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'pay_cancel':
         context.user_data.clear()
         await query.message.edit_text("Cancelled.")
-        # Show menu keyboard again
         kb = [['💳 Join Premium', '📊 My Status'], 
               ['🎁 24h Free Trial', '🎟 Redeem Code'], 
               ['📞 Support']]
@@ -233,7 +270,6 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'bc_cancel':
         context.user_data.clear()
         await query.message.edit_text("Cancelled.")
-        # Show menu keyboard again
         kb = [['💳 Join Premium', '📊 My Status'], 
               ['🎁 24h Free Trial', '🎟 Redeem Code'], 
               ['📞 Support']]
