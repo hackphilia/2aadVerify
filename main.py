@@ -92,6 +92,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     state = context.user_data.get('state')
 
+    # Define menu buttons to exclude from payment proof forwarding
+    MENU_BUTTONS = ['💳 Join Premium', '📊 My Status', '🎁 24h Free Trial', 
+                    '🎟 Redeem Code', '📞 Support', '🛠 Admin: Broadcast', 
+                    '🛠 Admin: Gen Code']
+
     # ADMIN: GENERATE CODE BUTTON LOGIC
     if text == '🛠 Admin: Gen Code' and int(user_id) == ADMIN_ID:
         context.user_data['state'] = 'WAIT_GEN_DAYS'
@@ -134,10 +139,42 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link = await context.bot.create_chat_invite_link(GROUP_ID, member_limit=1)
             await update.message.reply_text(f"✅ Success! {days} days added.\nLink: {link.invite_link}")
             context.user_data['state'] = None
-        else: await update.message.reply_text("❌ Invalid code.")
+        else: 
+            await update.message.reply_text("❌ Invalid code.")
+        return
 
-    # PAYMENT PROOF FORWARDING
-    if not text.startswith('/') and state is None and int(user_id) != ADMIN_ID:
+    # USER MENUS - Process these BEFORE payment proof forwarding
+    if text == '📊 My Status':
+        db = load_db()
+        if user_id not in db["users"]: 
+            return await update.message.reply_text("❌ No active plan.")
+        exp = datetime.datetime.strptime(db["users"][user_id], "%Y-%m-%d %H:%M:%S")
+        rem = exp - datetime.datetime.now()
+        return await update.message.reply_text(f"⏳ Left: {rem.days}d {rem.seconds//3600}h")
+    
+    elif text == '💳 Join Premium':
+        kb = [[InlineKeyboardButton("🪙 USDT", callback_data='p_usdt')], 
+              [InlineKeyboardButton("☀️ SOL", callback_data='p_sol')], 
+              [InlineKeyboardButton("💎 TON", callback_data='p_ton')]]
+        return await update.message.reply_text("Select Coin:", reply_markup=InlineKeyboardMarkup(kb))
+    
+    elif text == '🎁 24h Free Trial':
+        db = load_db()
+        if user_id in db["trials"]: 
+            return await update.message.reply_text("❌ Used.")
+        db["users"][user_id] = (datetime.datetime.now() + datetime.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        db["trials"].append(user_id); save_db_and_sync(db)
+        link = await context.bot.create_chat_invite_link(GROUP_ID, member_limit=1)
+        return await update.message.reply_text(f"🎁 Trial Active! Join: {link.invite_link}")
+    
+    elif text == '📞 Support': 
+        return await update.message.reply_text("📞 @ibenium")
+
+    # PAYMENT PROOF FORWARDING - Only for non-menu, non-command text
+    if (not text.startswith('/') and 
+        state is None and 
+        int(user_id) != ADMIN_ID and 
+        text not in MENU_BUTTONS):
         kb = [[InlineKeyboardButton("Approve 1D", callback_data=f"adm_1_{user_id}"),
                InlineKeyboardButton("Approve 7D", callback_data=f"adm_7_{user_id}"),
                InlineKeyboardButton("Approve 30D", callback_data=f"adm_30_{user_id}")],
@@ -145,32 +182,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(ADMIN_ID, f"📩 Proof from {user_id}:\n{text}", reply_markup=InlineKeyboardMarkup(kb))
         await update.message.reply_text("Proof sent to Admin.")
 
-    # USER MENUS
-    if text == '📊 My Status':
-        db = load_db()
-        if user_id not in db["users"]: return await update.message.reply_text("❌ No active plan.")
-        exp = datetime.datetime.strptime(db["users"][user_id], "%Y-%m-%d %H:%M:%S")
-        rem = exp - datetime.datetime.now()
-        await update.message.reply_text(f"⏳ Left: {rem.days}d {rem.seconds//3600}h")
-    elif text == '💳 Join Premium':
-        kb = [[InlineKeyboardButton("🪙 USDT", callback_data='p_usdt')], [InlineKeyboardButton("☀️ SOL", callback_data='p_sol')], [InlineKeyboardButton("💎 TON", callback_data='p_ton')]]
-        await update.message.reply_text("Select Coin:", reply_markup=InlineKeyboardMarkup(kb))
-    elif text == '🎁 24h Free Trial':
-        db = load_db()
-        if user_id in db["trials"]: return await update.message.reply_text("❌ Used.")
-        db["users"][user_id] = (datetime.datetime.now() + datetime.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-        db["trials"].append(user_id); save_db_and_sync(db)
-        link = await context.bot.create_chat_invite_link(GROUP_ID, member_limit=1)
-        await update.message.reply_text(f"🎁 Trial Active! Join: {link.invite_link}")
-    elif text == '📞 Support': await update.message.reply_text("📞 @ibenium")
-
 async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; data = query.data; await query.answer()
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    user_id = str(update.effective_user.id)
 
     if data.startswith('adm_'):
         _, days, uid = data.split('_')
         if days == 'rej':
-            await context.bot.send_message(uid, "❌ Rejected."); return await query.message.edit_text("Rejected.")
+            await context.bot.send_message(uid, "❌ Rejected.")
+            return await query.message.edit_text("Rejected.")
         db = load_db()
         db["users"][uid] = (datetime.datetime.now() + datetime.timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
         save_db_and_sync(db)
@@ -180,12 +202,15 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith('p_'):
         context.user_data['coin'] = data
-        kb = [[InlineKeyboardButton("1 Day ($2)", callback_data='d_1')], [InlineKeyboardButton("7 Days ($10)", callback_data='d_7')], [InlineKeyboardButton("30 Days ($35)", callback_data='d_30')]]
+        kb = [[InlineKeyboardButton("1 Day ($2)", callback_data='d_1')], 
+              [InlineKeyboardButton("7 Days ($10)", callback_data='d_7')], 
+              [InlineKeyboardButton("30 Days ($35)", callback_data='d_30')]]
         await query.message.edit_text("Select Duration:", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith('d_'):
         context.user_data['days'] = data.split('_')[1]
-        kb = [[InlineKeyboardButton("✅ Proceed", callback_data='pay_confirm'), InlineKeyboardButton("❌ Cancel", callback_data='pay_cancel')]]
+        kb = [[InlineKeyboardButton("✅ Proceed", callback_data='pay_confirm'), 
+               InlineKeyboardButton("❌ Cancel", callback_data='pay_cancel')]]
         await query.message.edit_text(f"Pay for {context.user_data['days']} day(s)?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == 'pay_confirm':
@@ -193,15 +218,41 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addr = USDT_ADDR if 'usdt' in coin else SOL_ADDR if 'sol' in coin else TON_ADDR
         await query.message.edit_text(f"Address: `{addr}`\n\nPaste TXID/Screenshot here.")
 
-    elif data in ['pay_cancel', 'bc_cancel']:
-        context.user_data.clear(); await query.message.edit_text("Cancelled."); await start(update, context)
+    elif data == 'pay_cancel':
+        context.user_data.clear()
+        await query.message.edit_text("Cancelled.")
+        # Show menu keyboard again
+        kb = [['💳 Join Premium', '📊 My Status'], 
+              ['🎁 24h Free Trial', '🎟 Redeem Code'], 
+              ['📞 Support']]
+        if int(user_id) == ADMIN_ID:
+            kb.append(['🛠 Admin: Broadcast', '🛠 Admin: Gen Code'])
+        await context.bot.send_message(user_id, "🚀 2Aad Premium Management", 
+                                      reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+
+    elif data == 'bc_cancel':
+        context.user_data.clear()
+        await query.message.edit_text("Cancelled.")
+        # Show menu keyboard again
+        kb = [['💳 Join Premium', '📊 My Status'], 
+              ['🎁 24h Free Trial', '🎟 Redeem Code'], 
+              ['📞 Support']]
+        if int(user_id) == ADMIN_ID:
+            kb.append(['🛠 Admin: Broadcast', '🛠 Admin: Gen Code'])
+        await context.bot.send_message(user_id, "🚀 2Aad Premium Management", 
+                                      reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
     elif data == 'bc_confirm':
-        msg = context.user_data.get('bc_msg'); db = load_db()
+        msg = context.user_data.get('bc_msg')
+        db = load_db()
         for uid in db["all_users"].keys():
-            try: await context.bot.send_message(uid, f"📢 ANNOUNCEMENT\n\n{msg}"); await asyncio.sleep(0.05)
-            except: pass
-        await query.message.edit_text("✅ Sent."); context.user_data['state'] = None
+            try: 
+                await context.bot.send_message(uid, f"📢 ANNOUNCEMENT\n\n{msg}")
+                await asyncio.sleep(0.05)
+            except: 
+                pass
+        await query.message.edit_text("✅ Sent.")
+        context.user_data['state'] = None
 
 def main():
     global bot_app
