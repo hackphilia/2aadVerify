@@ -1,1 +1,10 @@
-{"users": {}, "trials": [], "all_users": {}, "codes": {}}
+{
+    "users": {},
+    "trials": [],
+    "all_users": {
+        "1783886673": {
+            "join": "2026-01-17"
+        }
+    },
+    "codes": {}
+}
